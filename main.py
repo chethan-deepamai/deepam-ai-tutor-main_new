@@ -1,0 +1,344 @@
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Query
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import os
+import uuid
+import tempfile
+from dotenv import load_dotenv
+from google.cloud import storage
+import firebase_admin
+from firebase_admin import auth, credentials
+from rag_system import create_rag_system
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+# Initialize Firebase Admin SDK
+if not firebase_admin._apps:
+    cred_path = os.path.join(os.path.dirname(__file__), 'firebase-adminsdk.json')
+    if os.path.exists(cred_path):
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred)
+
+# Initialize Google Cloud Storage client
+try:
+    storage_client = storage.Client()
+    BUCKET_NAME = os.getenv('GCS_BUCKET_NAME', 'deepam-ai-tutor.appspot.com')
+except Exception as e:
+    print(f"Warning: Could not initialize GCS client: {e}")
+    storage_client = None
+    BUCKET_NAME = None
+
+security = HTTPBearer(auto_error=False)
+
+# Initialize RAG system
+try:
+    rag_system = create_rag_system()
+    logger.info("RAG system initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize RAG system: {e}")
+    rag_system = None
+
+app = FastAPI(title="DeepAM AI Tutor API", version="1.0.0")
+
+@app.get("/")
+def root():
+    return {"message": "Server is running"}
+
+@app.get("/test")
+def test():
+    return {"message": "Test endpoint working"}
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify Firebase token"""
+    if not credentials:
+        return None
+    try:
+        decoded_token = auth.verify_id_token(credentials.credentials)
+        return decoded_token
+    except Exception as e:
+        print(f"Token verification failed: {e}")
+        return None
+
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    board: str = Form(...),
+    subject: str = Form(...),
+    class_: str = Form(...),
+    language: str = Form(...),
+    user: dict = Depends(verify_token)
+):
+    """
+    Upload a file endpoint with Google Cloud Storage integration and RAG processing
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    try:
+        # Validate file type
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+        
+        # Read file content
+        content = await file.read()
+        
+        if storage_client and BUCKET_NAME:
+            # Upload to Google Cloud Storage
+            bucket = storage_client.bucket(BUCKET_NAME)
+            
+            # Generate unique filename
+            file_id = str(uuid.uuid4())
+            gcs_filename = f"textbooks/{board}/{subject}/class_{class_}/{language}/{file_id}_{file.filename}"
+            
+            blob = bucket.blob(gcs_filename)
+            blob.upload_from_string(content, content_type="application/pdf")
+            
+            gcs_uri = f"gs://{BUCKET_NAME}/{gcs_filename}"
+            
+            # Store metadata
+            metadata = {
+                "board": board,
+                "subject": subject,
+                "class": class_,
+                "language": language,
+                "user_id": user.get("uid"),
+                "original_filename": file.filename,
+                "gcs_uri": gcs_uri,
+                "filename": file.filename
+            }
+            
+            # Process document with RAG system
+            if rag_system:
+                try:
+                    logger.info(f"Processing document with RAG system: {file.filename}")
+                    doc_id = rag_system.process_and_store_document(content, metadata)
+                    logger.info(f"Document processed successfully: {doc_id}")
+                    
+                    return {
+                        "message": "File uploaded and processed successfully",
+                        "gcs_uri": gcs_uri,
+                        "filename": file.filename,
+                        "document_id": doc_id,
+                        "metadata": metadata,
+                        "size": len(content),
+                        "processing_status": "completed"
+                    }
+                except Exception as e:
+                    logger.error(f"RAG processing failed: {e}")
+                    return {
+                        "message": "File uploaded but processing failed",
+                        "gcs_uri": gcs_uri,
+                        "filename": file.filename,
+                        "metadata": metadata,
+                        "size": len(content),
+                        "processing_status": "failed",
+                        "processing_error": str(e)
+                    }
+            else:
+                return {
+                    "message": "File uploaded successfully (RAG processing unavailable)",
+                    "gcs_uri": gcs_uri,
+                    "filename": file.filename,
+                    "metadata": metadata,
+                    "size": len(content),
+                    "processing_status": "rag_unavailable"
+                }
+        else:
+            # Fallback: save locally if GCS is not available
+            temp_dir = tempfile.gettempdir()
+            local_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{file.filename}")
+            
+            with open(local_path, "wb") as f:
+                f.write(content)
+            
+            # Mock GCS URI for local development
+            gcs_uri = f"file://{local_path}"
+            
+            # Store metadata
+            metadata = {
+                "board": board,
+                "subject": subject,
+                "class": class_,
+                "language": language,
+                "user_id": user.get("uid"),
+                "original_filename": file.filename,
+                "gcs_uri": gcs_uri,
+                "filename": file.filename,
+                "local_path": local_path
+            }
+            
+            # Process document with RAG system
+            if rag_system:
+                try:
+                    logger.info(f"Processing local document with RAG system: {file.filename}")
+                    doc_id = rag_system.process_and_store_document(content, metadata)
+                    logger.info(f"Local document processed successfully: {doc_id}")
+                    
+                    return {
+                        "message": "File uploaded and processed successfully (local storage)",
+                        "gcs_uri": gcs_uri,
+                        "filename": file.filename,
+                        "document_id": doc_id,
+                        "content_type": file.content_type,
+                        "size": len(content),
+                        "local_path": local_path,
+                        "processing_status": "completed"
+                    }
+                except Exception as e:
+                    logger.error(f"Local RAG processing failed: {e}")
+                    return {
+                        "message": "File uploaded but processing failed (local storage)",
+                        "gcs_uri": gcs_uri,
+                        "filename": file.filename,
+                        "content_type": file.content_type,
+                        "size": len(content),
+                        "local_path": local_path,
+                        "processing_status": "failed",
+                        "processing_error": str(e)
+                    }
+            else:
+                return {
+                    "message": "File uploaded successfully (local storage, RAG processing unavailable)",
+                    "gcs_uri": gcs_uri,
+                    "filename": file.filename,
+                    "content_type": file.content_type,
+                    "size": len(content),
+                    "local_path": local_path,
+                    "processing_status": "rag_unavailable"
+                }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+@app.post("/chat")
+async def chat(
+    query: str = Query(...),
+    class_: str = Query("10", alias="class"),
+    board: str = Query("CBSE/NCERT"),
+    state: str = Query("national"),
+    subject: str = Query("Science"),
+    language: str = Query("en"),
+    user: dict = Depends(verify_token)
+):
+    """
+    Chat endpoint for AI tutor with full RAG implementation
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    try:
+        if rag_system:
+            # Use RAG system to generate intelligent response
+            logger.info(f"Processing query with RAG: {query}")
+            result = rag_system.generate_answer(
+                query=query,
+                board=board,
+                subject=subject,
+                class_=class_,
+                language=language,
+                user_id=user.get("uid")
+            )
+            
+            logger.info(f"RAG response generated with {result.get('context_used', 0)} context documents")
+            return result
+        else:
+            # Fallback response when RAG is not available
+            query_id = str(uuid.uuid4())
+            response_text = f"I apologize, but the AI tutoring system is currently not available. Your question about '{query}' for {board} {subject} (Class {class_}) has been noted. Please try again later or contact support."
+            
+            return {
+                "response": response_text,
+                "sources": [],
+                "query_id": query_id,
+                "metadata": {
+                    "board": board,
+                    "subject": subject,
+                    "class": class_,
+                    "language": language,
+                    "state": state
+                },
+                "context_used": 0,
+                "confidence": "low",
+                "status": "rag_unavailable"
+            }
+    except Exception as e:
+        logger.error(f"Chat endpoint error: {e}")
+        query_id = str(uuid.uuid4())
+        return {
+            "response": f"I encountered an error while processing your question about '{query}'. Please try rephrasing your question or try again later.",
+            "sources": [],
+            "query_id": query_id,
+            "metadata": {
+                "board": board,
+                "subject": subject,
+                "class": class_,
+                "language": language,
+                "state": state
+            },
+            "error": str(e),
+            "context_used": 0,
+            "confidence": "low"
+        }
+
+@app.post("/feedback")
+async def submit_feedback(
+    query_id: str = Form(...),
+    rating: int = Form(...),
+    comment: str = Form(""),
+    user: dict = Depends(verify_token)
+):
+    """
+    Submit feedback for a chat response
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    try:
+        # Store feedback (in a real implementation, you'd save this to a database)
+        feedback_data = {
+            "query_id": query_id,
+            "rating": rating,
+            "comment": comment,
+            "user_id": user.get("uid"),
+            "timestamp": "mock_timestamp"
+        }
+        
+        return {
+            "message": "Feedback submitted successfully",
+            "feedback_id": str(uuid.uuid4())
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Feedback submission failed: {str(e)}")
+
+@app.post("/process")
+async def process_document(
+    gcs_input_uri: str = Form(...),
+    lang_hints: list = Form(default=['en']),
+    lang_primary: str = Form(default="en"),
+    edition_year: int = Form(default=2024),
+    overrides: dict = Form(default={})
+):
+    """
+    Process document using Document AI (mock implementation)
+    """
+    try:
+        # This would normally use Google Document AI to process the PDF
+        # For now, return a mock response
+        return {
+            "message": "Document processing started",
+            "gcs_input_uri": gcs_input_uri,
+            "status": "processing",
+            "job_id": str(uuid.uuid4())
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)

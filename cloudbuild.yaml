@@ -1,0 +1,56 @@
+steps:
+       - name: 'gcr.io/cloud-builders/docker'
+         args: ['build', '-t', 'gcr.io/$PROJECT_ID/deepam-service', '-f', 'Dockerfile', '.']
+       - name: 'gcr.io/cloud-builders/docker'
+         args: ['build', '-t', 'gcr.io/$PROJECT_ID/deepam-pubsub', '-f', 'Dockerfile.pubsub', '.']
+       - name: 'gcr.io/cloud-builders/docker'
+         args: ['build', '-t', 'gcr.io/$PROJECT_ID/deepam-ui', '-f', 'Dockerfile.streamlit', '.']
+       - name: 'gcr.io/cloud-builders/docker'
+         args: ['push', 'gcr.io/$PROJECT_ID/deepam-service']
+       - name: 'gcr.io/cloud-builders/docker'
+         args: ['push', 'gcr.io/$PROJECT_ID/deepam-pubsub']
+       - name: 'gcr.io/cloud-builders/docker'
+         args: ['push', 'gcr.io/$PROJECT_ID/deepam-ui']
+       - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+         args:
+           - run
+           - deploy
+           - deepam-service
+           - --image=gcr.io/$PROJECT_ID/deepam-service
+           - --platform=managed
+           - --region=us-central1
+           - --allow-unauthenticated
+           - --service-account=deepam-ai-tutor@appspot.gserviceaccount.com
+           - --set-env-vars=PROJECT_ID=deepam-ai-tutor,REGION=us-central1,DOC_AI_LOCATION=us,DOC_AI_PROCESSOR_ID=9b0055f505933b1,API_KEY=test-api-key-123,VECTOR_SEARCH_INDEX_ID=1524943462888112128,VECTOR_SEARCH_DEPLOYED_INDEX_ID=3650888777611608064,FIREBASE_CRED_PATH=/app/firebase-adminsdk.json
+           - --set-secrets=FIREBASE_CRED_PATH=firebase-adminsdk:latest
+         entrypoint: gcloud
+       - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+         args:
+           - run
+           - deploy
+           - deepam-pubsub
+           - --image=gcr.io/$PROJECT_ID/deepam-pubsub
+           - --platform=managed
+           - --region=us-central1
+           - --no-allow-unauthenticated
+           - --service-account=deepam-ai-tutor@appspot.gserviceaccount.com
+           - --set-env-vars=MAIN_SERVICE_URL=https://deepam-service-abc123-uc.a.run.app,API_KEY=test-api-key-123
+         entrypoint: gcloud
+       - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+         args:
+           - run
+           - deploy
+           - deepam-ui
+           - --image=gcr.io/$PROJECT_ID/deepam-ui
+           - --platform=managed
+           - --region=us-central1
+           - --allow-unauthenticated
+           - --set-env-vars=API_URL=https://deepam-service-abc123-uc.a.run.app,FIREBASE_CONFIG=eyJhcGlLZXkiOiAiQUl6YVN5RDVfcWNydXliLWdWeWs1S0RxSzhlYzg5NHFTb3ZVSmoiLCJhdXRoRG9tYWluIjoiZGVlcGFtLWFpLXR1dG9yLmZpcmViYXNlYXBwLmNvbSIsInByb2plY3RJZCI6ImRlZXBhbS1haS10dXRvciIsInN0b3JhZ2VCdWNrZXQiOiJkZWVwYW0tYWktdHV0b3IuZmlyZWJhc2VzdG9yYWdlLmFwcCIsIm1lc3NhZ2luZ1NlbmRlcklkIjoiNjgyNTE4NTcwODY4IiwiYXBwSWQiOiIxOjY4MjUxODU3MDg2ODp3ZWI6ZThjNmEwNzJjNDU2MzAxNWNhNmUyMSIsIm1lYXN1cmVtZW50SWQiOiJHLTBZNVpaUUtLTTMifQ==
+           - --set-secrets=FIREBASE_CRED_PATH=firebase-adminsdk:latest
+         entrypoint: gcloud
+     substitutions:
+       _SERVICE_ACCOUNT: deepam-ai-tutor@appspot.gserviceaccount.com
+       _PROCESSOR_ID: 9b0055f505933b1
+       _INDEX_ID: 1524943462888112128
+       _API_KEY: test-api-key-123
+       _FIREBASE_CONFIG: eyJhcGlLZXkiOiAiQUl6YVN5RDVfcWNydXliLWdWeWs1S0RxSzhlYzg5NHFTb3ZVSmoiLCJhdXRoRG9tYWluIjoiZGVlcGFtLWFpLXR1dG9yLmZpcmViYXNlYXBwLmNvbSIsInByb2plY3RJZCI6ImRlZXBhbS1haS10dXRvciIsInN0b3JhZ2VCdWNrZXQiOiJkZWVwYW0tYWktdHV0b3IuZmlyZWJhc2VzdG9yYWdlLmFwcCIsIm1lc3NhZ2luZ1NlbmRlcklkIjoiNjgyNTE4NTcwODY4IiwiYXBwSWQiOiIxOjY4MjUxODU3MDg2ODp3ZWI6ZThjNmEwNzJjNDU2MzAxNWNhNmUyMSIsIm1lYXN1cmVtZW50SWQiOiJHLTBZNVpaUUtLTTMifQ==
