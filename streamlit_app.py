@@ -9,12 +9,7 @@ import firebase_admin
 from firebase_admin import auth, credentials
 
 # Firebase configuration
-API_URL = os.environ.get('API_URL', 'http://localhost:8080')  # Default                    # Display audio player if we have cached audio
-                    if audio_key in st.session_state:
-                        st.audio(st.session_state[audio_key], format="audio/mp3")
-                        st.success(f"🎵 Audio ready! Language: {lang_code.upper()}")
-
-                with st.form("feedback"):PI server
+API_URL = os.environ.get('API_URL', 'http://localhost:8080')  # Default API server
 
 # Load Firebase Admin credentials
 cred_path = os.path.join(os.path.dirname(__file__), 'firebase-adminsdk.json')
@@ -226,9 +221,59 @@ if 'user' in st.session_state:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    for message in st.session_state.messages:
+    for i, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
+            if message["role"] == "assistant":
+                tts_key = f"tts_enabled_{i}"
+                audio_key = f"audio_content_{i}"
+                
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    play_sound = st.checkbox(
+                        "🔊 Play Response as Sound", 
+                        key=tts_key,
+                        help="Check this box to generate and play audio of the response"
+                    )
+                
+                with col2:
+                    if st.button("🗑️ Clear Cache", key=f"clear_cache_{i}"):
+                        if audio_key in st.session_state:
+                            del st.session_state[audio_key]
+                        if tts_key in st.session_state:
+                            st.session_state[tts_key] = False
+                        st.success("Audio cache cleared!")
+                        st.rerun()
+
+                if play_sound:
+                    if audio_key not in st.session_state:
+                        with st.spinner("🎵 Generating audio..."):
+                            try:
+                                headers = {"Authorization": f"Bearer {st.session_state.user}"}
+                                tts_response = requests.post(
+                                    f"{API_URL}/text-to-speech",
+                                    headers=headers,
+                                    json={
+                                        "text": message["content"],
+                                        "language_code": lang_code,
+                                    }
+                                )
+                                if tts_response.status_code == 200:
+                                    st.session_state[audio_key] = tts_response.content
+                                    st.success("✅ Audio generated successfully!")
+                                else:
+                                    st.error(f"❌ TTS failed: {tts_response.text}")
+                                    st.session_state[tts_key] = False
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ TTS failed: {str(e)}")
+                                st.session_state[tts_key] = False
+                                st.rerun()
+                    
+                    if audio_key in st.session_state:
+                        st.audio(st.session_state[audio_key], format="audio/mp3", autoplay=True)
+                        st.info(f"🎵 Playing audio in {lang_code}")
 
     input_mode = st.radio("Input Mode", ("Text", "Voice"), key="input_mode")
     if input_mode == "Text":
