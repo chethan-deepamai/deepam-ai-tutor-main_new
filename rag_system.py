@@ -299,96 +299,76 @@ class VectorStore:
         return similar_docs
 
 class AIResponseGenerator:
-    """Generates AI responses using Google's Gemini model."""
+    """Generates AI responses using Google's Gemini model (AI Studio key)."""
     
     def __init__(self, project_id: str, location: str = "us-central1"):
-        self.project_id = project_id
-        self.location = location
-        
         try:
-            # Configure the Gemini API key
-            gemini_api_key = os.getenv("GEMINI_API_KEY")
-            if not gemini_api_key:
-                raise ValueError("GEMINI_API_KEY environment variable not set.")
-            
-            genai.configure(api_key=gemini_api_key)
-            
-            self.model = genai.GenerativeModel('gemini-2.0-flash')
-            logger.info("AI Response Generator initialized with Gemini 2.0 Flash.")
+            api_key = os.getenv("GEMINI_API_KEY")  # set this in your env
+            if not api_key:
+                raise ValueError("GEMINI_API_KEY is not set")
 
+            # New SDK pattern: create a Client with the API key
+            self.client = genai.Client(api_key=api_key)
+            self.model_name = "gemini-2.0-flash"
+            logger.info("AI Response Generator initialized (AI Studio key).")
         except Exception as e:
             logger.error(f"Failed to initialize Gemini: {e}")
-            self.model = None
+            self.client = None
+            self.model_name = None
 
-    def generate_response(self, query: str, context_docs: List[Dict[str, Any]], 
-                         metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate AI response using retrieved context and Gemini."""
-
-        if not self.model:
-            return {
-                "response": "The AI response generator is not configured correctly. Please check the API key.",
-                "sources": [], "confidence": "error"
-            }
+    def generate_response(self, query: str, context_docs: List[Dict[str, Any]], metadata: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.client or not self.model_name:
+            return {"response": "AI not configured. Check GEMINI_API_KEY.", "sources": [], "confidence": "error"}
 
         if not context_docs:
-            # Handle cases with no context
-            response_text = f"I couldn't find specific information about '{query}' in the uploaded materials for {metadata.get('subject', 'the subject')}. Please try rephrasing your question or uploading the relevant textbook."
-            return {"response": response_text, "sources": [], "confidence": "low"}
+            msg = (f"I couldn't find specific information about '{query}' in the uploaded materials "
+                   f"for {metadata.get('subject','the subject')}. Try rephrasing your question or upload the relevant textbook.")
+            return {"response": msg, "sources": [], "confidence": "low"}
 
-        # Prepare the context and prompt for Gemini
         combined_context = "\n\n".join([doc["text"] for doc in context_docs])
-        
         prompt = f"""
-        You are an expert AI tutor for a 10th-grade student. Your name is DeepAM.
-        Your goal is to provide a clear, simple, and helpful explanation based ONLY on the provided context from the student's textbook.
-        Do not use any information outside of the provided context.
-        
-        The student is studying:
-        - Board: {metadata.get('board', 'CBSE/NCERT')}
-        - Subject: {metadata.get('subject', 'Science')}
-        - Language: {metadata.get('language', 'English')}
+You are an expert AI tutor for a 10th-grade student. Your name is DeepAM.
 
-        CONTEXT FROM TEXTBOOK:
-        ---
-        {combined_context}
-        ---
+Student:
+Board: {metadata.get('board','CBSE/NCERT')}
+Subject: {metadata.get('subject','Science')}
+Language: {metadata.get('language','English')}
 
-        QUESTION: "{query}"
+CONTEXT:
+---
+{combined_context}
+---
 
-        Based on the context, please provide a step-by-step explanation in simple terms.
-        - If the context is insufficient, state that you cannot answer fully from the provided material and suggest what to look for.
-        - Keep the language simple and appropriate for a 10th-grade student.
-        - Explain in {metadata.get('language', 'English')}.
-        """
+QUESTION: "{query}"
+
+Give a simple, step-by-step explanation in {metadata.get('language','English')}.
+If context is insufficient, say so and suggest what to look for.
+"""
 
         try:
-            # Generate content using Gemini
-            response = self.model.generate_content(prompt)
-            
-            # Extract sources
+            resp = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt
+            )
+
+            # Build sources list from doc metadata
             sources = []
-            for doc in context_docs:
-                doc_metadata = doc.get('metadata', {})
-                filename = doc_metadata.get('filename', 'Textbook')
-                source = f"{metadata.get('board', 'CBSE/NCERT')} {metadata.get('subject', 'Science')} - {filename}"
-                if source not in sources:
-                    sources.append(source)
-            
+            for d in context_docs:
+                md = d.get("metadata", {})
+                filename = md.get("filename", "Textbook")
+                label = f"{metadata.get('board','CBSE/NCERT')} {metadata.get('subject','Science')} - {filename}"
+                if label not in sources:
+                    sources.append(label)
+
             return {
-                "response": response.text,
+                "response": resp.text,
                 "sources": sources,
                 "context_used": len(context_docs),
-                "confidence": "high" if len(context_docs) > 0 else "low"
+                "confidence": "high"
             }
-
         except Exception as e:
-            logger.error(f"Error generating response from Gemini: {e}")
-            return {
-                "response": f"I apologize, but I encountered an error while generating a response for '{query}'. Please try again.",
-                "sources": [],
-                "confidence": "error",
-                "error_details": str(e)
-            }
+            logger.error(f"Gemini error: {e}")
+            return {"response": f"Error generating response for '{query}'.", "sources": [], "confidence": "error", "error_details": str(e)}
 
 class RAGSystem:
     """Main RAG system that orchestrates document processing, vector storage, and AI responses"""
