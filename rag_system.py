@@ -45,34 +45,123 @@ class DocumentProcessor:
                 self.processor_name = self.client.processor_path(
                     project_id, location, processor_id
                 )
-                logger.info("Document AI client initialized successfully")
+                
+                # Try to get processor info to validate it's the right type
+                try:
+                    processor_info = self.client.get_processor(name=self.processor_name)
+                    logger.info(f"Document AI processor type: {processor_info.type_}")
+                    logger.info(f"Document AI processor display name: {processor_info.display_name}")
+                    
+                    # Check if it's an OCR processor
+                    if "OCR" not in processor_info.type_.upper() and "FORM" not in processor_info.type_.upper():
+                        logger.warning(f"Processor type '{processor_info.type_}' may not be optimal for text extraction. Consider using OCR_PROCESSOR.")
+                    
+                    logger.info("Document AI client initialized successfully")
+                except Exception as info_error:
+                    logger.warning(f"Could not get processor info: {info_error}, but will proceed with processing")
+                    logger.info("Document AI client initialized successfully")
         except Exception as e:
             logger.warning(f"Document AI initialization failed: {e}. Will use PyPDF2 fallback.")
     
     def process_pdf_document_ai(self, file_content: bytes, mime_type: str = "application/pdf") -> str:
-        """Process PDF using Google Document AI"""
+        """Process PDF using Google Document AI with multi-language support"""
         if not self.client:
             raise Exception("Document AI client not initialized")
         
-        # Create the document object
-        raw_document = documentai.RawDocument(content=file_content, mime_type=mime_type)
+        try:
+            # Create the document object
+            raw_document = documentai.RawDocument(content=file_content, mime_type=mime_type)
+            
+            # Configure the process request for OCR processor (not entity extraction)
+            request = documentai.ProcessRequest(
+                name=self.processor_name, 
+                raw_document=raw_document,
+                # Add process options for better OCR
+                process_options=documentai.ProcessOptions(
+                    ocr_config=documentai.OcrConfig(
+                        enable_native_pdf_parsing=True,
+                        enable_image_quality_scores=True,
+                        enable_symbol=True,
+                        # Enable advanced features for better text extraction
+                        premium_features=documentai.OcrConfig.PremiumFeatures(
+                            enable_selection_mark_detection=True,
+                            compute_style_info=True,
+                            enable_math_ocr=False
+                        )
+                    )
+                )
+            )
+            
+            # Process the document
+            result = self.client.process_document(request=request)
+            document = result.document
+            
+            # Extract text with better Unicode handling
+            text = document.text
+            
+            # Additional processing for multi-language support
+            if text:
+                # Normalize Unicode for better handling of Indic scripts
+                import unicodedata
+                text = unicodedata.normalize('NFC', text)
+                
+                # Clean up the text while preserving Unicode characters
+                # Remove only control characters but keep all script characters
+                cleaned_text = ""
+                for char in text:
+                    # Keep printable characters, whitespace, and Unicode script characters
+                    if char.isprintable() or char.isspace() or ord(char) > 127:
+                        cleaned_text += char
+                
+                text = cleaned_text
+                
+                logger.info(f"Document AI extracted {len(text)} characters")
+                
+                # Log a sample for debugging (first 200 chars)
+                sample_text = text[:200].replace('\n', '\\n')
+                logger.info(f"Sample extracted text: {sample_text}")
+            
+            return text
         
-        # Configure the process request
-        request = documentai.ProcessRequest(
-            name=self.processor_name, raw_document=raw_document
-        )
+        except Exception as e:
+            # If the error is about entity types, try a simpler request
+            if "entity_types" in str(e).lower():
+                logger.warning("Retrying Document AI with basic OCR request")
+                return self.process_pdf_document_ai_basic(file_content, mime_type)
+            else:
+                raise e
+    
+    def process_pdf_document_ai_basic(self, file_content: bytes, mime_type: str = "application/pdf") -> str:
+        """Basic Document AI processing without advanced options"""
+        try:
+            # Create the document object
+            raw_document = documentai.RawDocument(content=file_content, mime_type=mime_type)
+            
+            # Simple process request without extra options
+            request = documentai.ProcessRequest(
+                name=self.processor_name, 
+                raw_document=raw_document
+            )
+            
+            # Process the document
+            result = self.client.process_document(request=request)
+            document = result.document
+            
+            # Extract and normalize text
+            text = document.text
+            if text:
+                import unicodedata
+                text = unicodedata.normalize('NFC', text)
+                logger.info(f"Document AI basic extraction: {len(text)} characters")
+            
+            return text
         
-        # Process the document
-        result = self.client.process_document(request=request)
-        document = result.document
-        
-        # Extract text
-        text = document.text
-        
-        return text
+        except Exception as e:
+            logger.error(f"Document AI basic processing also failed: {e}")
+            raise e
     
     def process_pdf_pypdf2(self, file_content: bytes) -> str:
-        """Fallback PDF processing using PyPDF2"""
+        """Fallback PDF processing using PyPDF2 with Unicode handling"""
         try:
             # Create a temporary file
             with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
@@ -83,30 +172,109 @@ class DocumentProcessor:
             text = ""
             with open(temp_file_path, 'rb') as file:
                 pdf_reader = PyPDF2.PdfReader(file)
-                for page in pdf_reader.pages:
-                    text += page.extract_text() + "\n"
+                for page_num, page in enumerate(pdf_reader.pages):
+                    try:
+                        page_text = page.extract_text()
+                        # Clean and normalize Unicode text
+                        if page_text:
+                            # Normalize Unicode characters
+                            import unicodedata
+                            page_text = unicodedata.normalize('NFC', page_text)
+                            text += page_text + "\n"
+                    except Exception as e:
+                        logger.warning(f"Failed to extract text from page {page_num}: {e}")
+                        continue
             
             # Clean up temporary file
             os.unlink(temp_file_path)
+            
+            # If no text extracted, try alternative method
+            if not text.strip():
+                logger.warning("No text extracted with PyPDF2, trying alternative extraction")
+                text = self.process_pdf_alternative(file_content)
             
             return text
         except Exception as e:
             logger.error(f"PyPDF2 processing failed: {e}")
             raise
     
-    def process_document(self, file_content: bytes) -> str:
-        """Process document with Document AI fallback to PyPDF2"""
+    def process_pdf_alternative(self, file_content: bytes) -> str:
+        """Alternative PDF processing for complex scripts"""
         try:
-            # Try Document AI first
-            if self.client:
-                logger.info("Processing document with Document AI")
-                return self.process_pdf_document_ai(file_content)
+            import io
+            from PyPDF2 import PdfReader
+            
+            # Try with different extraction methods
+            text = ""
+            pdf_stream = io.BytesIO(file_content)
+            pdf_reader = PdfReader(pdf_stream)
+            
+            for page_num, page in enumerate(pdf_reader.pages):
+                try:
+                    # Try different extraction methods
+                    if hasattr(page, 'extractText'):
+                        page_text = page.extractText()
+                    else:
+                        page_text = page.extract_text()
+                    
+                    if page_text:
+                        # Handle Unicode normalization for Indic scripts
+                        import unicodedata
+                        page_text = unicodedata.normalize('NFC', page_text)
+                        
+                        # Additional cleaning for Kannada and other Indic scripts
+                        # Remove null characters and control characters
+                        page_text = ''.join(char for char in page_text if ord(char) > 31 or char in '\t\n\r')
+                        
+                        text += page_text + "\n"
+                except Exception as e:
+                    logger.warning(f"Alternative extraction failed for page {page_num}: {e}")
+                    continue
+            
+            return text
         except Exception as e:
-            logger.warning(f"Document AI failed: {e}. Falling back to PyPDF2")
+            logger.error(f"Alternative PDF processing failed: {e}")
+            return ""
+    
+    def process_document(self, file_content: bytes) -> str:
+        """Process document with Document AI fallback to PyPDF2 with enhanced multi-language support"""
+        extracted_text = ""
         
-        # Fallback to PyPDF2
-        logger.info("Processing document with PyPDF2")
-        return self.process_pdf_pypdf2(file_content)
+        # Try Document AI first (best for multi-language)
+        if self.client:
+            try:
+                logger.info("Processing document with Document AI for multi-language support")
+                extracted_text = self.process_pdf_document_ai(file_content)
+                
+                if extracted_text and len(extracted_text.strip()) > 50:  # Reasonable amount of text
+                    logger.info(f"Document AI successfully extracted {len(extracted_text)} characters")
+                    return extracted_text
+                else:
+                    logger.warning("Document AI extracted insufficient text, trying fallback")
+                    
+            except Exception as e:
+                logger.warning(f"Document AI failed: {e}. Falling back to PyPDF2")
+        
+        # Fallback to PyPDF2 with enhanced Unicode support
+        logger.info("Processing document with PyPDF2 (fallback)")
+        try:
+            extracted_text = self.process_pdf_pypdf2(file_content)
+            
+            if extracted_text and len(extracted_text.strip()) > 10:
+                logger.info(f"PyPDF2 extracted {len(extracted_text)} characters")
+                return extracted_text
+            else:
+                logger.warning("PyPDF2 extracted insufficient text")
+                
+        except Exception as e:
+            logger.error(f"PyPDF2 also failed: {e}")
+        
+        # If both methods fail or extract minimal text
+        if not extracted_text or len(extracted_text.strip()) < 10:
+            logger.error("Both Document AI and PyPDF2 failed to extract meaningful text")
+            raise Exception("Failed to extract text from document. The document may be image-based or corrupted.")
+        
+        return extracted_text
 
 class VectorStore:
     """Handles vector storage and retrieval using ChromaDB"""
@@ -132,10 +300,38 @@ class VectorStore:
         
         return collection
     
+    def normalize_language(self, language: str) -> str:
+        """Normalize language codes to consistent format"""
+        language_map = {
+            'english': 'english',
+            'en': 'english',
+            'hindi': 'hindi', 
+            'hi': 'hindi',
+            'tamil': 'tamil',
+            'ta': 'tamil',
+            'telugu': 'telugu',
+            'te': 'telugu',
+            'kannada': 'kannada',
+            'kn': 'kannada',
+            'malayalam': 'malayalam',
+            'ml': 'malayalam',
+            'bengali': 'bengali',
+            'bn': 'bengali',
+            'gujarati': 'gujarati',
+            'gu': 'gujarati',
+            'marathi': 'marathi',
+            'mr': 'marathi',
+            'punjabi': 'punjabi',
+            'pa': 'punjabi'
+        }
+        return language_map.get(language.lower(), language.lower())
+    
     def generate_collection_name(self, board: str, subject: str, class_: str, language: str) -> str:
         """Generate a standardized collection name"""
+        # Normalize language first
+        normalized_language = self.normalize_language(language)
         # Sanitize collection name
-        name = f"{board}_{subject}_class{class_}_{language}".lower()
+        name = f"{board}_{subject}_class{class_}_{normalized_language}".lower()
         name = "".join(c if c.isalnum() or c == "_" else "_" for c in name)
         return name[:50]  # Limit length
     

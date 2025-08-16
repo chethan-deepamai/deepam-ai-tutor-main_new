@@ -1,14 +1,17 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import Response
 import os
 import uuid
 import tempfile
 from dotenv import load_dotenv
 from google.cloud import storage
+from google.cloud import texttospeech
 import firebase_admin
 from firebase_admin import auth, credentials
 from rag_system import create_rag_system
 import logging
+from pydantic import BaseModel
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,13 +29,30 @@ if not firebase_admin._apps:
 # Initialize Google Cloud Storage client
 try:
     storage_client = storage.Client()
-    BUCKET_NAME = os.getenv('GCS_BUCKET_NAME', 'deepam-ai-tutor.appspot.com')
+    BUCKET_NAME = os.getenv('GCS_BUCKET_NAME', 'deepam-input')
+    OUTPUT_BUCKET_NAME = os.getenv('GCS_OUTPUT_BUCKET_NAME', 'deepam-output')
+    print(f"Attempting to connect to GCS buckets: {BUCKET_NAME}, {OUTPUT_BUCKET_NAME}")
+    
+    # For now, skip bucket validation and assume they exist
+    # The actual bucket access will be tested during upload/download operations
+    print(f"GCS client initialized with buckets: {BUCKET_NAME} (input), {OUTPUT_BUCKET_NAME} (output)")
+    
 except Exception as e:
     print(f"Warning: Could not initialize GCS client: {e}")
+    print("Falling back to local storage...")
     storage_client = None
     BUCKET_NAME = None
+    OUTPUT_BUCKET_NAME = None
 
 security = HTTPBearer(auto_error=False)
+
+# Initialize Text-to-Speech client
+try:
+    tts_client = texttospeech.TextToSpeechClient()
+    logger.info("Text-to-Speech client initialized successfully")
+except Exception as e:
+    logger.warning(f"Text-to-Speech client initialization failed: {e}")
+    tts_client = None
 
 # Initialize RAG system
 try:
@@ -44,13 +64,13 @@ except Exception as e:
 
 app = FastAPI(title="DeepAM AI Tutor API", version="1.0.0")
 
-@app.get("/")
-def root():
-    return {"message": "Server is running"}
-
-@app.get("/test")
-def test():
-    return {"message": "Test endpoint working"}
+# Pydantic models
+class TTSRequest(BaseModel):
+    text: str
+    language_code: str = "en-US"
+    voice_gender: str = "NEUTRAL"  # NEUTRAL, MALE, FEMALE
+    speaking_rate: float = 1.0
+    audio_encoding: str = "MP3"  # MP3, LINEAR16, OGG_OPUS
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify Firebase token"""
@@ -62,6 +82,72 @@ async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(secur
     except Exception as e:
         print(f"Token verification failed: {e}")
         return None
+
+@app.get("/")
+def root():
+    return {"message": "Server is running"}
+
+@app.get("/test")
+def test():
+    return {"message": "Test endpoint working"}
+
+@app.post("/text-to-speech")
+async def text_to_speech(request: TTSRequest, user=Depends(verify_token)):
+    """
+    Convert text to speech using Google Cloud Text-to-Speech
+    """
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    if not tts_client:
+        raise HTTPException(status_code=503, detail="Text-to-Speech service not available")
+    
+    try:
+        # Prepare the synthesis input
+        synthesis_input = texttospeech.SynthesisInput(text=request.text)
+        
+        # Configure voice selection
+        voice_gender_map = {
+            "NEUTRAL": texttospeech.SsmlVoiceGender.NEUTRAL,
+            "MALE": texttospeech.SsmlVoiceGender.MALE,
+            "FEMALE": texttospeech.SsmlVoiceGender.FEMALE
+        }
+        
+        voice = texttospeech.VoiceSelectionParams(
+            language_code=request.language_code,
+            ssml_gender=voice_gender_map.get(request.voice_gender.upper(), texttospeech.SsmlVoiceGender.NEUTRAL)
+        )
+        
+        # Configure audio output
+        encoding_map = {
+            "MP3": texttospeech.AudioEncoding.MP3,
+            "LINEAR16": texttospeech.AudioEncoding.LINEAR16,
+            "OGG_OPUS": texttospeech.AudioEncoding.OGG_OPUS
+        }
+        
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=encoding_map.get(request.audio_encoding.upper(), texttospeech.AudioEncoding.MP3),
+            speaking_rate=request.speaking_rate
+        )
+        
+        # Perform the text-to-speech synthesis
+        response = tts_client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
+        
+        # Return the audio content as a response
+        media_type = "audio/mpeg" if request.audio_encoding.upper() == "MP3" else "audio/wav"
+        return Response(
+            content=response.audio_content,
+            media_type=media_type,
+            headers={"Content-Disposition": "attachment; filename=speech.mp3"}
+        )
+        
+    except Exception as e:
+        logger.error(f"Text-to-speech conversion failed: {e}")
+        raise HTTPException(status_code=500, detail=f"TTS conversion failed: {str(e)}")
 
 @app.post("/upload")
 async def upload_file(
@@ -87,66 +173,70 @@ async def upload_file(
         content = await file.read()
         
         if storage_client and BUCKET_NAME:
-            # Upload to Google Cloud Storage
-            bucket = storage_client.bucket(BUCKET_NAME)
-            
-            # Generate unique filename
-            file_id = str(uuid.uuid4())
-            gcs_filename = f"textbooks/{board}/{subject}/class_{class_}/{language}/{file_id}_{file.filename}"
-            
-            blob = bucket.blob(gcs_filename)
-            blob.upload_from_string(content, content_type="application/pdf")
-            
-            gcs_uri = f"gs://{BUCKET_NAME}/{gcs_filename}"
-            
-            # Store metadata
-            metadata = {
-                "board": board,
-                "subject": subject,
-                "class": class_,
-                "language": language,
-                "user_id": user.get("uid"),
-                "original_filename": file.filename,
-                "gcs_uri": gcs_uri,
-                "filename": file.filename
-            }
-            
-            # Process document with RAG system
-            if rag_system:
-                try:
-                    logger.info(f"Processing document with RAG system: {file.filename}")
-                    doc_id = rag_system.process_and_store_document(content, metadata)
-                    logger.info(f"Document processed successfully: {doc_id}")
-                    
-                    return {
-                        "message": "File uploaded and processed successfully",
-                        "gcs_uri": gcs_uri,
-                        "filename": file.filename,
-                        "document_id": doc_id,
-                        "metadata": metadata,
-                        "size": len(content),
-                        "processing_status": "completed"
-                    }
-                except Exception as e:
-                    logger.error(f"RAG processing failed: {e}")
-                    return {
-                        "message": "File uploaded but processing failed",
-                        "gcs_uri": gcs_uri,
-                        "filename": file.filename,
-                        "metadata": metadata,
-                        "size": len(content),
-                        "processing_status": "failed",
-                        "processing_error": str(e)
-                    }
-            else:
-                return {
-                    "message": "File uploaded successfully (RAG processing unavailable)",
+            try:
+                # Upload to Google Cloud Storage
+                bucket = storage_client.bucket(BUCKET_NAME)
+                
+                # Generate unique filename
+                file_id = str(uuid.uuid4())
+                gcs_filename = f"textbooks/{board}/{subject}/class_{class_}/{language}/{file_id}_{file.filename}"
+                
+                blob = bucket.blob(gcs_filename)
+                blob.upload_from_string(content, content_type="application/pdf")
+                
+                gcs_uri = f"gs://{BUCKET_NAME}/{gcs_filename}"
+                
+                # Store metadata
+                metadata = {
+                    "board": board,
+                    "subject": subject,
+                    "class": class_,
+                    "language": language,
+                    "user_id": user.get("uid"),
+                    "original_filename": file.filename,
                     "gcs_uri": gcs_uri,
-                    "filename": file.filename,
-                    "metadata": metadata,
-                    "size": len(content),
-                    "processing_status": "rag_unavailable"
+                    "filename": file.filename
                 }
+                
+                # Process document with RAG system
+                if rag_system:
+                    try:
+                        logger.info(f"Processing document with RAG system: {file.filename}")
+                        doc_id = rag_system.process_and_store_document(content, metadata)
+                        logger.info(f"Document processed successfully: {doc_id}")
+                        
+                        return {
+                            "message": "File uploaded and processed successfully",
+                            "gcs_uri": gcs_uri,
+                            "filename": file.filename,
+                            "document_id": doc_id,
+                            "metadata": metadata,
+                            "size": len(content),
+                            "processing_status": "completed"
+                        }
+                    except Exception as e:
+                        logger.error(f"RAG processing failed: {e}")
+                        return {
+                            "message": "File uploaded but processing failed",
+                            "gcs_uri": gcs_uri,
+                            "filename": file.filename,
+                            "metadata": metadata,
+                            "size": len(content),
+                            "processing_status": "failed",
+                            "processing_error": str(e)
+                        }
+                else:
+                    return {
+                        "message": "File uploaded successfully (RAG processing unavailable)",
+                        "gcs_uri": gcs_uri,
+                        "filename": file.filename,
+                        "metadata": metadata,
+                        "size": len(content),
+                        "processing_status": "rag_unavailable"
+                    }
+            except Exception as gcs_error:
+                logger.warning(f"GCS upload failed: {gcs_error}. Falling back to local storage.")
+                # Fall through to local storage
         else:
             # Fallback: save locally if GCS is not available
             temp_dir = tempfile.gettempdir()

@@ -9,7 +9,12 @@ import firebase_admin
 from firebase_admin import auth, credentials
 
 # Firebase configuration
-API_URL = os.environ.get('API_URL', 'http://localhost:8080')  # Default to local FastAPI server
+API_URL = os.environ.get('API_URL', 'http://localhost:8080')  # Default                    # Display audio player if we have cached audio
+                    if audio_key in st.session_state:
+                        st.audio(st.session_state[audio_key], format="audio/mp3")
+                        st.success(f"🎵 Audio ready! Language: {lang_code.upper()}")
+
+                with st.form("feedback"):PI server
 
 # Load Firebase Admin credentials
 cred_path = os.path.join(os.path.dirname(__file__), 'firebase-adminsdk.json')
@@ -271,13 +276,104 @@ if 'user' in st.session_state:
                     st.markdown(data['response'])
                     st.markdown("**Sources:** " + ", ".join(data['sources']))
 
-                if st.checkbox("Play Response as Voice"):
-                    tts_client = texttospeech.TextToSpeechClient()
-                    synthesis_input = texttospeech.SynthesisInput(text=data['response'])
-                    voice = texttospeech.VoiceSelectionParams(language_code=lang_code, ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL)
-                    audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3, speaking_rate=1.0)
-                    tts_response = tts_client.synthesize_speech(input=synthesis_input, voice=voice, audio_config=audio_config)
-                    st.audio(tts_response.audio_content, format="audio/mp3")
+                # TTS Controls - using checkbox to avoid button disappearing
+                tts_key = f"tts_enabled_{hash(data['response'])}"
+                audio_key = f"audio_content_{hash(data['response'])}"
+                
+                # Create persistent checkbox for TTS control
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    # Use checkbox instead of button - this won't disappear on click
+                    play_sound = st.checkbox(
+                        "🔊 Play Response as Sound", 
+                        key=tts_key,
+                        help="Check this box to generate and play audio of the response"
+                    )
+                
+                with col2:
+                    if st.button("🗑️ Clear Cache", key=f"clear_cache_{hash(data['response'])}"):
+                        # Clear audio cache for this response
+                        if audio_key in st.session_state:
+                            del st.session_state[audio_key]
+                        st.success("Audio cache cleared!")
+                
+                # Generate and play audio if checkbox is checked
+                if play_sound:
+                    # Check if we already have audio cached
+                    if audio_key not in st.session_state:
+                        with st.spinner("🎵 Generating audio using Google TTS..."):
+                            try:
+                                # Use Google Cloud Text-to-Speech directly
+                                tts_client = texttospeech.TextToSpeechClient()
+                                
+                                # Configure language-specific voices
+                                if lang_code in ['hi', 'hi-IN']:
+                                    voice_lang = "hi-IN"
+                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
+                                elif lang_code in ['kn', 'kn-IN']:
+                                    voice_lang = "kn-IN"
+                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
+                                elif lang_code in ['ta', 'ta-IN']:
+                                    voice_lang = "ta-IN"
+                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
+                                elif lang_code in ['te', 'te-IN']:
+                                    voice_lang = "te-IN"
+                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
+                                elif lang_code in ['ml', 'ml-IN']:
+                                    voice_lang = "ml-IN"
+                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
+                                elif lang_code in ['bn', 'bn-IN']:
+                                    voice_lang = "bn-IN"
+                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
+                                else:
+                                    voice_lang = "en-US"
+                                    voice_gender = texttospeech.SsmlVoiceGender.NEUTRAL
+                                
+                                # Prepare synthesis input
+                                synthesis_input = texttospeech.SynthesisInput(text=data['response'])
+                                
+                                # Configure voice
+                                voice = texttospeech.VoiceSelectionParams(
+                                    language_code=voice_lang,
+                                    ssml_gender=voice_gender
+                                )
+                                
+                                # Configure audio output
+                                audio_config = texttospeech.AudioConfig(
+                                    audio_encoding=texttospeech.AudioEncoding.MP3,
+                                    speaking_rate=0.9
+                                )
+                                
+                                # Generate speech
+                                response_tts = tts_client.synthesize_speech(
+                                    input=synthesis_input,
+                                    voice=voice,
+                                    audio_config=audio_config
+                                )
+                                
+                                # Cache the audio
+                                st.session_state[audio_key] = response_tts.audio_content
+                                st.success("✅ Audio generated successfully!")
+                                
+                            except Exception as e:
+                                st.error(f"❌ TTS failed: {str(e)}")
+                                st.session_state[tts_key] = False
+                                st.rerun()
+                    
+                    # Display audio player if we have cached audio
+                    if audio_key in st.session_state:
+                        st.audio(st.session_state[audio_key], format="audio/mp3", autoplay=True)
+                        st.info(f"🎵 Playing audio in {lang_code}")
+                
+                # Add a clear cache option
+                if st.button("�️ Clear Audio Cache", key=f"clear_cache_{hash(data['response'])}"):
+                    # Clear audio cache for this response
+                    if audio_key in st.session_state:
+                        del st.session_state[audio_key]
+                    st.session_state[tts_key] = False
+                    st.success("Audio cache cleared!")
+                    st.rerun()
 
                 with st.form("feedback"):
                     rating = st.slider("Rate this response (1-5)", 1, 5, key="rating")
