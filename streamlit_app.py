@@ -208,19 +208,38 @@ if 'user' in st.session_state:
                     st.sidebar.write(f"Exception: {str(e)}")
     
     st.divider()
-    
+
     # Chat Section
     st.header("💬 AI Tutor Chat")
-    
+
+    # --- Callback functions for state management ---
+    def handle_clear_cache(audio_key, tts_key):
+        """Callback to clear audio cache and reset TTS checkbox."""
+        if audio_key in st.session_state:
+            del st.session_state[audio_key]
+        if tts_key in st.session_state:
+            st.session_state[tts_key] = False
+        st.success("Audio cache cleared!")
+
+    def handle_tts_error(key):
+        """Callback to safely reset a TTS checkbox on error."""
+        if key in st.session_state:
+            st.session_state[key] = False
+
     board = st.selectbox("Board", ["CBSE/NCERT", "Tamil Nadu Stateboard", "Karnataka Stateboard", "Andhra Pradesh Stateboard", "Maharashtra Stateboard"])
     state = board.split(" ")[0].lower() if "Stateboard" in board else "national"
     subject = st.selectbox("Subject", ["Science", "Math", "Social Studies", "English", "Regional Language"])
     language = st.selectbox("Language", ["English", "Hindi", "Tamil", "Telugu", "Kannada", "Marathi"])
-    lang_code = ['en', 'hi', 'ta', 'te', 'kn', 'mr'][["English", "Hindi", "Tamil", "Telugu", "Kannada", "Marathi"].index(language)]
+    lang_code_map = {
+        "English": "en", "Hindi": "hi", "Tamil": "ta", "Telugu": "te", 
+        "Kannada": "kn", "Marathi": "mr"
+    }
+    lang_code = lang_code_map.get(language, "en")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
+    # Display existing messages
     for i, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -231,22 +250,21 @@ if 'user' in st.session_state:
                 col1, col2 = st.columns([2, 1])
                 
                 with col1:
-                    play_sound = st.checkbox(
+                    st.checkbox(
                         "🔊 Play Response as Sound", 
                         key=tts_key,
                         help="Check this box to generate and play audio of the response"
                     )
                 
                 with col2:
-                    if st.button("🗑️ Clear Cache", key=f"clear_cache_{i}"):
-                        if audio_key in st.session_state:
-                            del st.session_state[audio_key]
-                        if tts_key in st.session_state:
-                            st.session_state[tts_key] = False
-                        st.success("Audio cache cleared!")
-                        st.rerun()
+                    st.button(
+                        "🗑️ Clear Cache", 
+                        key=f"clear_cache_{i}",
+                        on_click=handle_clear_cache,
+                        args=(audio_key, tts_key)
+                    )
 
-                if play_sound:
+                if tts_key in st.session_state and st.session_state[tts_key]:
                     if audio_key not in st.session_state:
                         with st.spinner("🎵 Generating audio..."):
                             try:
@@ -262,171 +280,100 @@ if 'user' in st.session_state:
                                 if tts_response.status_code == 200:
                                     st.session_state[audio_key] = tts_response.content
                                     st.success("✅ Audio generated successfully!")
+                                    st.rerun()
                                 else:
                                     st.error(f"❌ TTS failed: {tts_response.text}")
-                                    st.session_state[tts_key] = False
+                                    handle_tts_error(tts_key)
                                     st.rerun()
                             except Exception as e:
                                 st.error(f"❌ TTS failed: {str(e)}")
-                                st.session_state[tts_key] = False
+                                handle_tts_error(tts_key)
                                 st.rerun()
                     
                     if audio_key in st.session_state:
-                        st.audio(st.session_state[audio_key], format="audio/mp3", autoplay=True)
-                        st.info(f"🎵 Playing audio in {lang_code}")
+                        st.audio(st.session_state[audio_key], format="audio/mp3")
 
+    # Handle user input
+    query = None
     input_mode = st.radio("Input Mode", ("Text", "Voice"), key="input_mode")
     if input_mode == "Text":
         query = st.chat_input("Ask a question about your subject...")
     else:
-        audio = audio_recorder.record()
-        if audio:
+        audio_bytes = audio_recorder(key='audio_input')
+        if audio_bytes:
+            st.info("Transcribing audio...")
             try:
                 client = speech.SpeechClient()
-                config = speech.RecognitionConfig(language_code=lang_code, enable_automatic_punctuation=True)
-                response = client.recognize(config=config, audio=speech.Audio(content=audio))
-                query = response.results[0].alternatives[0].transcript if response.results else ""
-                st.write(f"Transcribed: {query}")
-            except:
-                st.error("Voice recognition failed. Try again or use text.")
-                query = None
+                audio = speech.RecognitionAudio(content=audio_bytes)
+                config = speech.RecognitionConfig(
+                    language_code=lang_code,
+                    enable_automatic_punctuation=True
+                )
+                response = client.recognize(config=config, audio=audio)
+                if response.results:
+                    query = response.results[0].alternatives[0].transcript
+                    st.write(f"Transcribed: *{query}*")
+                else:
+                    st.warning("Could not transcribe audio. Please try again.")
+            except Exception as e:
+                st.error(f"Voice recognition failed: {e}")
 
+    # Process new query
     if query:
         st.session_state.messages.append({"role": "user", "content": query})
-        with st.chat_message("user"):
-            st.markdown(query)
-
-        try:
-            headers = {"Authorization": f"Bearer {st.session_state.user}"}
-            chat_url = f"{API_URL}/chat?query={requests.utils.quote(query)}&class=10&board={board}&state={state}&subject={subject}&language={lang_code}"
-            
-            st.sidebar.markdown("### Chat Request Debug")
-            st.sidebar.write("URL:", chat_url)
-            st.sidebar.write("Headers:", headers)
-            st.sidebar.write("Query:", query)
-            
-            response = requests.post(chat_url, headers=headers)
-            
-            st.sidebar.markdown("### Chat Response Debug")
-            st.sidebar.write("Status Code:", response.status_code)
-            try:
-                st.sidebar.write("Response:", response.json())
-            except:
-                st.sidebar.write("Raw Response:", response.text)
-            
-            if response.status_code == 200:
-                data = response.json()
-                st.session_state.messages.append({"role": "assistant", "content": data['response']})
-                with st.chat_message("assistant"):
-                    st.markdown(data['response'])
-                    st.markdown("**Sources:** " + ", ".join(data['sources']))
-
-                # TTS Controls - using checkbox to avoid button disappearing
-                tts_key = f"tts_enabled_{hash(data['response'])}"
-                audio_key = f"audio_content_{hash(data['response'])}"
-                
-                # Create persistent checkbox for TTS control
-                col1, col2 = st.columns([2, 1])
-                
-                with col1:
-                    # Use checkbox instead of button - this won't disappear on click
-                    play_sound = st.checkbox(
-                        "🔊 Play Response as Sound", 
-                        key=tts_key,
-                        help="Check this box to generate and play audio of the response"
-                    )
-                
-                with col2:
-                    if st.button("🗑️ Clear Cache", key=f"clear_cache_{hash(data['response'])}"):
-                        # Clear audio cache for this response
-                        if audio_key in st.session_state:
-                            del st.session_state[audio_key]
-                        st.success("Audio cache cleared!")
-                
-                # Generate and play audio if checkbox is checked
-                if play_sound:
-                    # Check if we already have audio cached
-                    if audio_key not in st.session_state:
-                        with st.spinner("🎵 Generating audio using Google TTS..."):
-                            try:
-                                # Use Google Cloud Text-to-Speech directly
-                                tts_client = texttospeech.TextToSpeechClient()
-                                
-                                # Configure language-specific voices
-                                if lang_code in ['hi', 'hi-IN']:
-                                    voice_lang = "hi-IN"
-                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
-                                elif lang_code in ['kn', 'kn-IN']:
-                                    voice_lang = "kn-IN"
-                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
-                                elif lang_code in ['ta', 'ta-IN']:
-                                    voice_lang = "ta-IN"
-                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
-                                elif lang_code in ['te', 'te-IN']:
-                                    voice_lang = "te-IN"
-                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
-                                elif lang_code in ['ml', 'ml-IN']:
-                                    voice_lang = "ml-IN"
-                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
-                                elif lang_code in ['bn', 'bn-IN']:
-                                    voice_lang = "bn-IN"
-                                    voice_gender = texttospeech.SsmlVoiceGender.FEMALE
-                                else:
-                                    voice_lang = "en-US"
-                                    voice_gender = texttospeech.SsmlVoiceGender.NEUTRAL
-                                
-                                # Prepare synthesis input
-                                synthesis_input = texttospeech.SynthesisInput(text=data['response'])
-                                
-                                # Configure voice
-                                voice = texttospeech.VoiceSelectionParams(
-                                    language_code=voice_lang,
-                                    ssml_gender=voice_gender
-                                )
-                                
-                                # Configure audio output
-                                audio_config = texttospeech.AudioConfig(
-                                    audio_encoding=texttospeech.AudioEncoding.MP3,
-                                    speaking_rate=0.9
-                                )
-                                
-                                # Generate speech
-                                response_tts = tts_client.synthesize_speech(
-                                    input=synthesis_input,
-                                    voice=voice,
-                                    audio_config=audio_config
-                                )
-                                
-                                # Cache the audio
-                                st.session_state[audio_key] = response_tts.audio_content
-                                st.success("✅ Audio generated successfully!")
-                                
-                            except Exception as e:
-                                st.error(f"❌ TTS failed: {str(e)}")
-                                st.session_state[tts_key] = False
-                                st.rerun()
+        
+        with st.chat_message("assistant"):
+            with st.spinner("DeepAM is thinking..."):
+                try:
+                    headers = {"Authorization": f"Bearer {st.session_state.user}"}
+                    chat_url = f"{API_URL}/chat"
                     
-                    # Display audio player if we have cached audio
-                    if audio_key in st.session_state:
-                        st.audio(st.session_state[audio_key], format="audio/mp3", autoplay=True)
-                        st.info(f"🎵 Playing audio in {lang_code}")
-                
-                # Add a clear cache option
-                if st.button("�️ Clear Audio Cache", key=f"clear_cache_{hash(data['response'])}"):
-                    # Clear audio cache for this response
-                    if audio_key in st.session_state:
-                        del st.session_state[audio_key]
-                    st.session_state[tts_key] = False
-                    st.success("Audio cache cleared!")
-                    st.rerun()
+                    payload = {
+                        "query": query,
+                        "class": "10",
+                        "board": board,
+                        "state": state,
+                        "subject": subject,
+                        "language": lang_code,
+                        "user_id": st.session_state.user
+                    }
 
-                with st.form("feedback"):
-                    rating = st.slider("Rate this response (1-5)", 1, 5, key="rating")
-                    comment = st.text_input("Feedback (optional)", key="comment")
-                    if st.form_submit_button("Submit Feedback"):
-                        requests.post(f"{API_URL}/feedback", json={"query_id": data['query_id'], "rating": rating, "comment": comment}, headers=headers)
-                        st.success("Feedback submitted")
-            else:
-                st.error("Error: " + response.text)
-        except Exception as e:
-            st.error(f"Chat error: {str(e)}")
+                    response = requests.post(chat_url, headers=headers, json=payload)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        # Check for backend error details before displaying response
+                        if "error_details" in data or data.get("confidence") == "error":
+                            st.error(f"An error occurred on the backend: {data.get('error_details', 'No details provided.')}")
+                        else:
+                            assistant_response = data.get('response', "Sorry, I couldn't generate a response.")
+                            st.session_state.messages.append({"role": "assistant", "content": assistant_response})
+                            st.rerun()
+                    else:
+                        st.error(f"Error from chat API: {response.status_code} - {response.text}")
+
+                except Exception as e:
+                    st.error(f"An error occurred while contacting the chat service: {e}")
+        
+    # Feedback form
+    if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
+        latest_response = st.session_state.messages[-1]["content"]
+        query_id = hash(latest_response)
+
+        with st.form(key=f"feedback_form_{query_id}"):
+            st.write("Was this response helpful?")
+            rating = st.slider("Rate this response (1=Not helpful, 5=Very helpful)", 1, 5, 3, key=f"rating_{query_id}")
+            comment = st.text_input("Feedback (optional)", key=f"comment_{query_id}")
+            
+            if st.form_submit_button("Submit Feedback"):
+                try:
+                    headers = {"Authorization": f"Bearer {st.session_state.user}"}
+                    feedback_payload = {
+                        "query_id": str(query_id), 
+                        "rating": rating, 
+                        "comment": comment
+                    }
+                    requests.post(f"{API_URL}/feedback", json=feedback_payload, headers=headers)
+                    st.success("Thank you for your feedback!")
+                except Exception as e:
+                    st.error(f"Could not submit feedback: {e}")

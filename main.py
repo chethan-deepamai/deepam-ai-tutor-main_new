@@ -11,7 +11,7 @@ import firebase_admin
 from firebase_admin import auth, credentials
 from rag_system import create_rag_system
 import logging
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +71,16 @@ class TTSRequest(BaseModel):
     voice_gender: str = "NEUTRAL"  # NEUTRAL, MALE, FEMALE
     speaking_rate: float = 1.0
     audio_encoding: str = "MP3"  # MP3, LINEAR16, OGG_OPUS
+
+class ChatRequest(BaseModel):
+    query: str
+    class_: str = Field("10", alias="class")
+    board: str = "CBSE/NCERT"
+    state: str = "national"
+    subject: str = "Science"
+    language: str = "en"
+    user_id: str
+
 
 async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify Firebase token"""
@@ -307,15 +317,7 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.post("/chat")
-async def chat(
-    query: str = Query(...),
-    class_: str = Query("10", alias="class"),
-    board: str = Query("CBSE/NCERT"),
-    state: str = Query("national"),
-    subject: str = Query("Science"),
-    language: str = Query("en"),
-    user: dict = Depends(verify_token)
-):
+async def chat(request: ChatRequest, user: dict = Depends(verify_token)):
     """
     Chat endpoint for AI tutor with full RAG implementation
     """
@@ -325,13 +327,13 @@ async def chat(
     try:
         if rag_system:
             # Use RAG system to generate intelligent response
-            logger.info(f"Processing query with RAG: {query}")
+            logger.info(f"Processing query with RAG: {request.query}")
             result = rag_system.generate_answer(
-                query=query,
-                board=board,
-                subject=subject,
-                class_=class_,
-                language=language,
+                query=request.query,
+                board=request.board,
+                subject=request.subject,
+                class_=request.class_,
+                language=request.language,
                 user_id=user.get("uid")
             )
             
@@ -340,18 +342,18 @@ async def chat(
         else:
             # Fallback response when RAG is not available
             query_id = str(uuid.uuid4())
-            response_text = f"I apologize, but the AI tutoring system is currently not available. Your question about '{query}' for {board} {subject} (Class {class_}) has been noted. Please try again later or contact support."
+            response_text = f"I apologize, but the AI tutoring system is currently not available. Your question about '{request.query}' for {request.board} {request.subject} (Class {request.class_}) has been noted. Please try again later or contact support."
             
             return {
                 "response": response_text,
                 "sources": [],
                 "query_id": query_id,
                 "metadata": {
-                    "board": board,
-                    "subject": subject,
-                    "class": class_,
-                    "language": language,
-                    "state": state
+                    "board": request.board,
+                    "subject": request.subject,
+                    "class": request.class_,
+                    "language": request.language,
+                    "state": request.state
                 },
                 "context_used": 0,
                 "confidence": "low",
@@ -361,15 +363,15 @@ async def chat(
         logger.error(f"Chat endpoint error: {e}")
         query_id = str(uuid.uuid4())
         return {
-            "response": f"I encountered an error while processing your question about '{query}'. Please try rephrasing your question or try again later.",
+            "response": f"I encountered an error while processing your question about '{request.query}'. Please try rephrasing your question or try again later.",
             "sources": [],
             "query_id": query_id,
             "metadata": {
-                "board": board,
-                "subject": subject,
-                "class": class_,
-                "language": language,
-                "state": state
+                "board": request.board,
+                "subject": request.subject,
+                "class": request.class_,
+                "language": request.language,
+                "state": request.state
             },
             "error": str(e),
             "context_used": 0,
