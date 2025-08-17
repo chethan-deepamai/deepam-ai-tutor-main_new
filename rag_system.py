@@ -315,6 +315,32 @@ class AIResponseGenerator:
             logger.error(f"Failed to initialize Gemini: {e}")
             self.client = None
             self.model_name = None
+    def _is_textbook_question(self, query: str, context_docs: List[Dict[str, Any]], subject: str) -> bool:
+        """Determine if the query is textbook-specific based on semantic similarity to context."""
+        if not context_docs:
+            return False
+        
+        # Encode query and context documents
+        query_embedding = self.embedding_model.encode(query)
+        context_texts = [doc['text'] for doc in context_docs]
+        context_embeddings = self.embedding_model.encode(context_texts)
+        
+        # Calculate similarity scores
+        similarities = np.dot(context_embeddings, query_embedding) / (
+            np.linalg.norm(context_embeddings, axis=1) * np.linalg.norm(query_embedding)
+        )
+        max_similarity = np.max(similarities) if similarities.size > 0 else 0.0
+        
+        # Use a dynamic baseline: compare against similarity to a neutral sentence (e.g., "This is a general topic")
+        neutral_sentence = "This is a general topic"
+        neutral_embedding = self.embedding_model.encode(neutral_sentence)
+        neutral_similarities = np.dot(context_embeddings, neutral_embedding) / (
+            np.linalg.norm(context_embeddings, axis=1) * np.linalg.norm(neutral_embedding)
+        )
+        avg_neutral_similarity = np.mean(neutral_similarities) if neutral_similarities.size > 0 else 0.0
+        
+        # Classify as textbook-specific if query similarity significantly exceeds the neutral baseline
+        return max_similarity > (avg_neutral_similarity * 1.5)  # Dynamic multiplier for relative threshold
 
     def generate_response(self, query: str, context_docs: List[Dict[str, Any]], metadata: Dict[str, Any]) -> Dict[str, Any]:
         if not self.client or not self.model_name:
@@ -327,22 +353,31 @@ class AIResponseGenerator:
 
         combined_context = "\n\n".join([doc["text"] for doc in context_docs])
         prompt = f"""
-You are an expert AI tutor for a 10th-grade student. Your name is DeepAM.
+Hi! I'm DeepAM, your friendly AI tutor for 10th-grade students. Ask me anything, and I’ll give you a clear, simple answer!
 
-Student:
-Board: {metadata.get('board','CBSE/NCERT')}
-Subject: {metadata.get('subject','Science')}
-Language: {metadata.get('language','English')}
+Student Details:
+- Board: {metadata.get('board', 'CBSE/NCERT')}
+- Subject: {metadata.get('subject', 'Science')}
+- Language: {metadata.get('language', 'English')}
 
-CONTEXT:
+CONTEXT FROM TEXTBOOK:
 ---
 {combined_context}
 ---
 
 QUESTION: "{query}"
 
-Give a simple, step-by-step explanation in {metadata.get('language','English')}.
-If context is insufficient, say so and suggest what to look for.
+Instructions:
+1. **Answer Directly**:
+   - For questions about the subject ({metadata.get('subject', 'Science')}) or textbook-specific terms (e.g., 'chapter', 'topic', 'photosynthesis'), use ONLY the provided context and answer concisely.
+   - For general questions (e.g., about topics outside the subject or textbook, like 'What is the tallest mountain?' or 'Who invented the telephone?'), answer using general knowledge, even if no context is provided.
+2. **Handling Insufficient Context**:
+   - If the question is textbook-related but the context is missing or insufficient, say so and suggest checking specific chapters or uploading the textbook.
+3. **Tone and Style**:
+   - Use a friendly, direct, and conversational tone, like a tutor chatting with a student.
+   - Answer in {metadata.get('language', 'English')}.
+   - Keep it simple, engaging, and encouraging for a 10th-grade student.
+   - Avoid mentioning question types, instructions, or context unless necessary for textbook-related answers.
 """
 
         try:
