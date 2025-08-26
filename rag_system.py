@@ -311,67 +311,80 @@ class VertexAISearchStore:
         
         logger.info(f"Added document {doc_id} with {len(chunks)} chunks. Metadata stored in GCS.")
         return doc_id
-
-def search_similar(self, query: str, board: str, subject: str, class_: str, 
-                  language: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """Search for similar content using Vertex AI Vector Search."""
-    # Generate query embedding
-    try:
-        query_embedding = self.embedding_model.get_embeddings([query])[0].values  # Assuming Vertex AI Embedding
-        logger.info(f"Query embedding shape: {len(query_embedding)}")
-    except AttributeError:
-        query_embedding = self.embedding_model.encode(query).tolist()  # Fallback for SentenceTransformers
-        logger.info(f"Query embedding shape (SentenceTransformers): {len(query_embedding)}")
-
-    # Prepare datapoint
-    datapoint = aiplatform_v1.IndexDatapoint(feature_vector=query_embedding)
-
-    # Prepare request
-    query_request = aiplatform_v1.FindNeighborsRequest.Query(
-        datapoint=datapoint,
-        neighbor_count=top_k
-    )
     
-    request = aiplatform_v1.FindNeighborsRequest(
-        index_endpoint=self.index_endpoint_name,
-        deployed_index_id=self.deployed_index_id,
-        queries=[query_request],
-        return_full_datapoint=False,
-    )
+    def search_similar(self, query: str, board: str, subject: str, class_: str,
+                       language: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search for similar content using Vertex AI Vector Search."""
+        # Generate query embedding
+        try:
+            # Some embedding clients expose get_embeddings; SentenceTransformer does not.
+            query_embedding = self.embedding_model.get_embeddings([query])[0].values  # type: ignore[attr-defined]
+            logger.info(f"Query embedding shape: {len(query_embedding)}")
+        except AttributeError:
+            query_embedding = self.embedding_model.encode(query).tolist()
+            logger.info(f"Query embedding shape (SentenceTransformers): {len(query_embedding)}")
 
-    try:
-        # Execute search
-        response = self.vector_search_client.find_neighbors(request)
-        logger.info(f"Find_neighbors response: {response}")
+        # Prepare datapoint
+        datapoint = aiplatform_v1.IndexDatapoint(feature_vector=query_embedding)
 
-        similar_docs = []
-        if response.nearest_neighbors:
-            for neighbor_list in response.nearest_neighbors:
-                for neighbor in neighbor_list.neighbors:
-                    vector_id = neighbor.datapoint.datapoint_id
-                    logger.info(f"Retrieved neighbor ID: {vector_id}")
-                    
-                    # Retrieve metadata from GCS
-                    blob = self.bucket.blob(f"{vector_id}.json")
-                    if blob.exists():
+        # Prepare request
+        query_request = aiplatform_v1.FindNeighborsRequest.Query(
+            datapoint=datapoint,
+            neighbor_count=top_k
+        )
+
+        request = aiplatform_v1.FindNeighborsRequest(
+            index_endpoint=self.index_endpoint_name,
+            deployed_index_id=self.deployed_index_id,
+            queries=[query_request],
+            return_full_datapoint=True,
+        )
+
+        try:
+            # Execute search
+            response = self.vector_search_client.find_neighbors(request)
+            logger.info(f"Find_neighbors response: {response}")
+
+            similar_docs: List[Dict[str, Any]] = []
+            if response.nearest_neighbors:
+                for neighbor_list in response.nearest_neighbors:
+                    for neighbor in neighbor_list.neighbors:
+                        # Get ID of the matched datapoint
+                        vector_id = getattr(neighbor.datapoint, 'datapoint_id', None) or getattr(neighbor, 'datapoint_id', None)
+                        if not vector_id:
+                            logger.warning("Neighbor missing datapoint_id; skipping")
+                            continue
+
+                        # Retrieve metadata from GCS
+                        blob = self.bucket.blob(f"{vector_id}.json")
+                        if not blob.exists():
+                            logger.warning(f"Metadata file {vector_id}.json not found in GCS bucket {self.bucket.name}")
+                            continue
+
                         metadata_string = blob.download_as_string()
                         doc_data = json.loads(metadata_string.decode('utf-8'))
+
+                        # Optional metadata filtering
+                        def _matches(field_key: str, field_value: str) -> bool:
+                            return not field_value or (str(doc_data.get(field_key, '')).strip().lower() == str(field_value).strip().lower())
+
+                        if not (_matches('board', board) and _matches('subject', subject) and _matches('class', class_) and _matches('language', language)):
+                            continue
+
                         similarity = 1.0 - neighbor.distance if neighbor.distance is not None else 0.0
                         similar_docs.append({
                             "text": doc_data.get("text", ""),
                             "metadata": {k: v for k, v in doc_data.items() if k != "text"},
                             "similarity": similarity
                         })
-                    else:
-                        logger.warning(f"Metadata file {vector_id}.json not found in GCS bucket {self.bucket.name}")
-        else:
-            logger.warning("No nearest neighbors found in response")
+            else:
+                logger.warning("No nearest neighbors found in response")
 
-        return similar_docs
+            return similar_docs
 
-    except Exception as e:
-        logger.error(f"Vertex AI search failed: {e}")
-        return []
+        except Exception as e:
+            logger.error(f"Vertex AI search failed: {e}")
+            return []
     
 class AIResponseGenerator:
     """Generates AI responses using Google's Gemini model (AI Studio key)."""
@@ -385,11 +398,14 @@ class AIResponseGenerator:
             # New SDK pattern: create a Client with the API key
             self.client = genai.Client(api_key=api_key)
             self.model_name = "gemini-2.0-flash"
+            # Local embeddings for any semantic checks inside this class
+            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
             logger.info("AI Response Generator initialized (AI Studio key).")
         except Exception as e:
             logger.error(f"Failed to initialize Gemini: {e}")
             self.client = None
             self.model_name = None
+            self.embedding_model = None
     def _is_textbook_question(self, query: str, context_docs: List[Dict[str, Any]], subject: str) -> bool:
         """Determine if the query is textbook-specific based on semantic similarity to context."""
         if not context_docs:
