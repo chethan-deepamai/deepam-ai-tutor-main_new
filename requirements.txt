@@ -17,7 +17,6 @@ protobuf==4.25.5
 tink==1.9.0
 langchain==0.1.0
 langchain-google-vertexai==1.0.0
-chromadb==0.4.22
 sentence-transformers==2.2.2
 PyPDF2==3.0.1
 python-multipart==0.0.6

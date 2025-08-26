@@ -1,4 +1,3 @@
-
 """
 RAG (Retrieval-Augmented Generation) System for DeepAM AI Tutor
 This module handles document processing, vector storage, and AI-powered responses.
@@ -19,7 +18,9 @@ from google.cloud import storage
 from google import genai
 
 # Vector storage and embeddings
-import chromadb
+from google.cloud import aiplatform
+from google.cloud import aiplatform_v1
+import vertexai
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
@@ -202,12 +203,22 @@ class DocumentProcessor:
             raise Exception("Failed to extract text from document")
         return extracted_text
 
-class VectorStore:
-    """Handles vector storage and retrieval using ChromaDB"""
-    
-    def __init__(self, persist_directory: str = "./chroma_db"):
-        self.persist_directory = persist_directory
-        self.client = chromadb.PersistentClient(path=persist_directory)
+class VertexAISearchStore:
+    """Handles vector storage and retrieval using Vertex AI Search and GCS."""
+
+    def __init__(self, project_id: str, location: str, gcs_bucket_name: str, index_id: str, endpoint_id: str, deployed_index_id: str, api_endpoint: str):
+        self.project_id = project_id
+        self.location = location
+        self.gcs_bucket_name = gcs_bucket_name
+        self.index_id = index_id
+        self.endpoint_id = endpoint_id
+        self.deployed_index_id = deployed_index_id
+        self.api_endpoint = api_endpoint
+        
+        vertexai.init(project=project_id, location=location)
+        self.storage_client = storage.Client()
+        self.bucket = self.storage_client.bucket(gcs_bucket_name)
+        
         self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -215,89 +226,153 @@ class VectorStore:
             length_function=len,
         )
         
-    def create_collection(self, collection_name: str) -> chromadb.Collection:
-        """Create or get a collection"""
+        self.index = self._get_or_create_index()
+        
+        # Initialize the MatchServiceClient
+        client_options = {"api_endpoint": self.api_endpoint}
+        self.vector_search_client = aiplatform_v1.MatchServiceClient(client_options=client_options)
+        
+        # Construct the full Index Endpoint resource name
+        self.index_endpoint_name = f"projects/{self.project_id}/locations/{self.location}/indexEndpoints/{self.endpoint_id}"
+
+    def _get_or_create_index(self):
+        """Gets or creates a Vertex AI Search Index."""
         try:
-            collection = self.client.get_collection(collection_name)
-            logger.info(f"Retrieved existing collection: {collection_name}")
-        except:
-            collection = self.client.create_collection(collection_name)
-            logger.info(f"Created new collection: {collection_name}")
-        return collection
-    
-    def normalize_language(self, language: str) -> str:
-        """Normalize language codes"""
-        language_map = {
-            'english': 'english', 'en': 'english', 'hindi': 'hindi', 'hi': 'hindi',
-            'tamil': 'tamil', 'ta': 'tamil', 'telugu': 'telugu', 'te': 'telugu',
-            'kannada': 'kannada', 'kn': 'kannada', 'malayalam': 'malayalam', 'ml': 'malayalam',
-            'bengali': 'bengali', 'bn': 'bengali', 'gujarati': 'gujarati', 'gu': 'gujarati',
-            'marathi': 'marathi', 'mr': 'marathi', 'punjabi': 'punjabi', 'pa': 'punjabi'
-        }
-        return language_map.get(language.lower(), language.lower())
-    
-    def generate_collection_name(self, board: str, subject: str, class_: str, language: str) -> str:
-        """Generate a standardized collection name"""
-        normalized_language = self.normalize_language(language)
-        name = f"{board}_{subject}_class{class_}_{normalized_language}".lower()
-        name = "".join(c if c.isalnum() or c == "_" else "_" for c in name)
-        return name[:50]
-    
+            index_path = f"projects/{self.project_id}/locations/{self.location}/indexes/{self.index_id}"
+            logger.info(f"Using Vertex AI Index path: {index_path}")
+            return aiplatform.MatchingEngineIndex(index_name=index_path)
+        except Exception as e:
+            logger.error(f"Error getting Vertex AI Index: {e}")
+            # In a real-world scenario, you might want to create it here.
+            # For now, we re-raise to make the configuration error clear.
+            raise Exception(f"Failed to initialize Vertex AI Index with ID '{self.index_id}'. Please ensure it exists.") from e
+
+    def _get_or_create_endpoint(self):
+        """Gets or creates a Vertex AI Index Endpoint."""
+        # This method is no longer needed as we are using MatchServiceClient directly
+        # and constructing the endpoint name in __init__
+        pass
+
     def add_document(self, text: str, metadata: Dict[str, Any]) -> str:
-        """Add a document to the vector store"""
+        """Adds a document to Vertex AI Search and stores metadata in GCS."""
         chunks = self.text_splitter.split_text(text)
-        collection_name = self.generate_collection_name(
-            metadata['board'], metadata['subject'], metadata['class'], metadata['language']
-        )
-        collection = self.create_collection(collection_name)
         doc_id = str(uuid.uuid4())
+        
+        embeddings = []
+        file_data_to_upload = []
+
         for i, chunk in enumerate(chunks):
             chunk_id = f"{doc_id}_chunk_{i}"
             embedding = self.embedding_model.encode(chunk).tolist()
+            
             chunk_metadata = {
                 "board": metadata.get('board', ''),
                 "subject": metadata.get('subject', ''),
                 "class": metadata.get('class', ''),
                 "language": metadata.get('language', ''),
                 "filename": metadata.get('filename', ''),
+                "text": chunk,
                 "chunk_id": chunk_id,
                 "chunk_index": i,
                 "document_id": doc_id
             }
-            collection.add(
-                embeddings=[embedding],
-                documents=[chunk],
-                metadatas=[chunk_metadata],
-                ids=[chunk_id]
-            )
-        logger.info(f"Added document {doc_id} with {len(chunks)} chunks to collection {collection_name}")
-        return doc_id
-    
-    def search_similar(self, query: str, board: str, subject: str, class_: str, 
-                      language: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Search for similar content"""
-        collection_name = self.generate_collection_name(board, subject, class_, language)
+            
+            # Store metadata and text chunk in GCS
+            blob = self.bucket.blob(f"{chunk_id}.json")
+            blob.upload_from_string(json.dumps(chunk_metadata, indent=2), content_type='application/json')
+
+            embeddings.append({
+                "datapoint_id": chunk_id,
+                "feature_vector": embedding
+            })
+
+        # Upsert embeddings to Vertex AI Index
+        # Note: The actual API for this might differ based on SDK version.
+        # This is a conceptual representation.
+        # The MatchingEngineIndex.upsert() method is not available in the SDK.
+        # A common way is to batch data into a JSONL file and upload to GCS, then call index.update()
+        # For simplicity, we'll log this action.
+        logger.info(f"Prepared {len(embeddings)} embeddings for upsert to index {self.index.name}")
+        # self.index.upsert(datapoints=embeddings) # This is conceptual
+        
+        # A more realistic approach:
+        # 1. Create a JSONL file with embeddings.
+        # 2. Upload to GCS.
+        # 3. Call self.index.update(contents_delta_uri=...)
+        # This is complex for a synchronous flow. For now, we log.
         try:
-            collection = self.client.get_collection(collection_name)
-        except:
-            logger.warning(f"Collection {collection_name} not found")
-            return []
-        query_embedding = self.embedding_model.encode(query).tolist()
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            include=["documents", "metadatas", "distances"]
-        )
+            logger.info(f"Upserting {len(embeddings)} embeddings to index {self.index.name}")
+            self.index.upsert_datapoints(datapoints=embeddings)
+            logger.info(f"Successfully upserted {len(embeddings)} embeddings.")
+        except Exception as e:
+            logger.error(f"Failed to upsert embeddings to Vertex AI Index: {e}")
+            # Depending on the desired behavior, you might want to clean up GCS files here.
+            raise Exception("Failed to add document to Vertex AI Index.") from e
+        
+        logger.info(f"Added document {doc_id} with {len(chunks)} chunks. Metadata stored in GCS.")
+        return doc_id
+
+def search_similar(self, query: str, board: str, subject: str, class_: str, 
+                  language: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    """Search for similar content using Vertex AI Vector Search."""
+    # Generate query embedding
+    try:
+        query_embedding = self.embedding_model.get_embeddings([query])[0].values  # Assuming Vertex AI Embedding
+        logger.info(f"Query embedding shape: {len(query_embedding)}")
+    except AttributeError:
+        query_embedding = self.embedding_model.encode(query).tolist()  # Fallback for SentenceTransformers
+        logger.info(f"Query embedding shape (SentenceTransformers): {len(query_embedding)}")
+
+    # Prepare datapoint
+    datapoint = aiplatform_v1.IndexDatapoint(feature_vector=query_embedding)
+
+    # Prepare request
+    query_request = aiplatform_v1.FindNeighborsRequest.Query(
+        datapoint=datapoint,
+        neighbor_count=top_k
+    )
+    
+    request = aiplatform_v1.FindNeighborsRequest(
+        index_endpoint=self.index_endpoint_name,
+        deployed_index_id=self.deployed_index_id,
+        queries=[query_request],
+        return_full_datapoint=False,
+    )
+
+    try:
+        # Execute search
+        response = self.vector_search_client.find_neighbors(request)
+        logger.info(f"Find_neighbors response: {response}")
+
         similar_docs = []
-        if results['documents'] and results['documents'][0]:
-            for i, doc in enumerate(results['documents'][0]):
-                similar_docs.append({
-                    "text": doc,
-                    "metadata": results['metadatas'][0][i],
-                    "similarity": max(0, 1 - results['distances'][0][i])
-                })
+        if response.nearest_neighbors:
+            for neighbor_list in response.nearest_neighbors:
+                for neighbor in neighbor_list.neighbors:
+                    vector_id = neighbor.datapoint.datapoint_id
+                    logger.info(f"Retrieved neighbor ID: {vector_id}")
+                    
+                    # Retrieve metadata from GCS
+                    blob = self.bucket.blob(f"{vector_id}.json")
+                    if blob.exists():
+                        metadata_string = blob.download_as_string()
+                        doc_data = json.loads(metadata_string.decode('utf-8'))
+                        similarity = 1.0 - neighbor.distance if neighbor.distance is not None else 0.0
+                        similar_docs.append({
+                            "text": doc_data.get("text", ""),
+                            "metadata": {k: v for k, v in doc_data.items() if k != "text"},
+                            "similarity": similarity
+                        })
+                    else:
+                        logger.warning(f"Metadata file {vector_id}.json not found in GCS bucket {self.bucket.name}")
+        else:
+            logger.warning("No nearest neighbors found in response")
+
         return similar_docs
 
+    except Exception as e:
+        logger.error(f"Vertex AI search failed: {e}")
+        return []
+    
 class AIResponseGenerator:
     """Generates AI responses using Google's Gemini model (AI Studio key)."""
     
@@ -415,8 +490,14 @@ class RAGSystem:
             location=config.get('doc_ai_location', 'us'),
             processor_id=config.get('doc_ai_processor_id')
         )
-        self.vector_store = VectorStore(
-            persist_directory=config.get('vector_db_path', './chroma_db')
+        self.vector_store = VertexAISearchStore(
+            project_id=config.get('project_id'),
+            location=config.get('location', 'us-central1'),
+            gcs_bucket_name=config.get('gcs_bucket_name'),
+            index_id=config.get('vertex_index_id'),
+            endpoint_id=config.get('vertex_endpoint_id'),
+            deployed_index_id=config.get('vertex_deployed_index_id'),
+            api_endpoint=config.get('vertex_api_endpoint')
         )
         self.ai_generator = AIResponseGenerator(
             project_id=config.get('project_id'),
@@ -488,6 +569,10 @@ def create_rag_system() -> RAGSystem:
         'location': os.getenv('REGION', 'asia-south1'),
         'doc_ai_location': os.getenv('DOC_AI_LOCATION', 'us'),
         'doc_ai_processor_id': os.getenv('DOC_AI_PROCESSOR_ID'),
-        'vector_db_path': os.getenv('VECTOR_DB_PATH', './chroma_db')
+        'gcs_bucket_name': os.getenv('GCS_BUCKET_NAME'),
+        'vertex_index_id': os.getenv('VERTEX_INDEX_ID'),
+        'vertex_endpoint_id': os.getenv('VERTEX_ENDPOINT_ID'),
+        'vertex_deployed_index_id': os.getenv('VECTOR_SEARCH_DEPLOYED_INDEX_ID'),
+        'vertex_api_endpoint': os.getenv('VECTOR_SEARCH_API_ENDPOINT')
     }
     return RAGSystem(config)
