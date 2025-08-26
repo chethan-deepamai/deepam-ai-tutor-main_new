@@ -213,7 +213,21 @@ class VertexAISearchStore:
         self.index_id = index_id
         self.endpoint_id = endpoint_id
         self.deployed_index_id = deployed_index_id
-        self.api_endpoint = api_endpoint
+        # Use region-specific API endpoint for MatchService; global endpoint returns 501
+        default_endpoint = f"{location}-aiplatform.googleapis.com"
+        if api_endpoint and api_endpoint.strip():
+            provided = api_endpoint.strip()
+            # If provided endpoint is global or doesn't include the location, override to region-specific
+            if provided == "aiplatform.googleapis.com" or self.location not in provided:
+                logger.warning(
+                    f"VECTOR_SEARCH_API_ENDPOINT '{provided}' is not region-specific for '{self.location}'. "
+                    f"Overriding to '{default_endpoint}'."
+                )
+                self.api_endpoint = default_endpoint
+            else:
+                self.api_endpoint = provided
+        else:
+            self.api_endpoint = default_endpoint
         
         vertexai.init(project=project_id, location=location)
         self.storage_client = storage.Client()
@@ -234,6 +248,65 @@ class VertexAISearchStore:
         
         # Construct the full Index Endpoint resource name
         self.index_endpoint_name = f"projects/{self.project_id}/locations/{self.location}/indexEndpoints/{self.endpoint_id}"
+        logger.info(f"Vertex AI Vector Search configured. API endpoint: {self.api_endpoint}, IndexEndpoint: {self.index_endpoint_name}, DeployedIndexId: {self.deployed_index_id}")
+
+        # Best-effort validation/logging of endpoint configuration
+        try:
+            ie_client = aiplatform_v1.IndexEndpointServiceClient(client_options=client_options)
+            endpoint = ie_client.get_index_endpoint(name=self.index_endpoint_name)
+            deployed_ids = [d.id for d in getattr(endpoint, 'deployed_indexes', [])]
+            logger.info(f"IndexEndpoint resolved. Deployed indexes: {deployed_ids}")
+            # Check whether any deployed index on this endpoint matches our index_id
+            endpoint_has_target_index = any(
+                getattr(d, 'index', '').endswith(f"/indexes/{self.index_id}") for d in getattr(endpoint, 'deployed_indexes', [])
+            )
+            if not endpoint_has_target_index:
+                logger.warning(
+                    f"Endpoint '{self.index_endpoint_name}' does not have index '{self.index_id}' deployed. "
+                    f"Attempting to auto-discover a correct endpoint."
+                )
+                # Attempt discovery: list endpoints and find one with our index deployed
+                parent = f"projects/{self.project_id}/locations/{self.location}"
+                for ep in ie_client.list_index_endpoints(parent=parent):
+                    for di in getattr(ep, 'deployed_indexes', []):
+                        if getattr(di, 'index', '').endswith(f"/indexes/{self.index_id}"):
+                            new_endpoint_name = getattr(ep, 'name', '')
+                            new_endpoint_id = new_endpoint_name.split('/')[-1]
+                            self.endpoint_id = new_endpoint_id
+                            self.index_endpoint_name = new_endpoint_name
+                            self.deployed_index_id = getattr(di, 'id', self.deployed_index_id)
+                            logger.info(
+                                f"Auto-selected IndexEndpoint '{self.index_endpoint_name}' with deployed_index_id '{self.deployed_index_id}' "
+                                f"for index '{self.index_id}'."
+                            )
+                            endpoint_has_target_index = True
+                            break
+                    if endpoint_has_target_index:
+                        break
+                if not endpoint_has_target_index:
+                    logger.warning(
+                        f"Could not find any IndexEndpoint in {self.location} with index '{self.index_id}' deployed. "
+                        f"Vector search may fail until deployment is corrected."
+                    )
+            # If we have a valid endpoint but wrong deployed_index_id, correct it
+            if endpoint_has_target_index:
+                # Refresh endpoint details if we switched
+                endpoint = ie_client.get_index_endpoint(name=self.index_endpoint_name)
+                deployed_ids = [d.id for d in getattr(endpoint, 'deployed_indexes', [])]
+                if self.deployed_index_id and self.deployed_index_id not in deployed_ids:
+                    logger.warning(
+                        f"Configured deployed_index_id '{self.deployed_index_id}' not found on endpoint. Available: {deployed_ids}"
+                    )
+                    # Prefer the one whose index matches our index_id
+                    preferred = None
+                    for d in getattr(endpoint, 'deployed_indexes', []):
+                        if getattr(d, 'index', '').endswith(f"/indexes/{self.index_id}"):
+                            preferred = d.id
+                            break
+                    self.deployed_index_id = preferred or (deployed_ids[0] if deployed_ids else self.deployed_index_id)
+                    logger.info(f"Using deployed_index_id '{self.deployed_index_id}'")
+        except Exception as e:
+            logger.warning(f"Could not validate IndexEndpoint '{self.index_endpoint_name}': {e}")
 
     def _get_or_create_index(self):
         """Gets or creates a Vertex AI Search Index."""
@@ -315,6 +388,11 @@ class VertexAISearchStore:
     def search_similar(self, query: str, board: str, subject: str, class_: str,
                        language: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Search for similar content using Vertex AI Vector Search."""
+        # Validate config
+        if not self.endpoint_id or not self.deployed_index_id:
+            logger.error("Vertex AI search misconfigured: endpoint_id or deployed_index_id is missing")
+            # Fallback to GCS search if misconfigured
+            return self._fallback_gcs_search(query, board, subject, class_, language, top_k)
         # Generate query embedding
         try:
             # Some embedding clients expose get_embeddings; SentenceTransformer does not.
@@ -384,6 +462,73 @@ class VertexAISearchStore:
 
         except Exception as e:
             logger.error(f"Vertex AI search failed: {e}")
+            # Fallback to brute-force GCS similarity search
+            return self._fallback_gcs_search(query, board, subject, class_, language, top_k)
+
+    def _fallback_gcs_search(self, query: str, board: str, subject: str, class_: str,
+                             language: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Fallback: brute-force similarity over chunk JSONs stored in GCS.
+        This runs when Vertex Vector Search isn't deployed or returns 501.
+        """
+        try:
+            logger.warning("Using fallback GCS search (no Vector Search endpoint available)")
+            # Collect candidate chunks (cap to avoid excessive scans)
+            MAX_BLOBS = int(os.getenv('FALLBACK_MAX_BLOBS', '1000'))
+            blobs_iter = self.storage_client.list_blobs(self.gcs_bucket_name)
+            candidates: List[Dict[str, Any]] = []
+            scanned = 0
+            for blob in blobs_iter:
+                if not blob.name.endswith('.json'):
+                    continue
+                try:
+                    metadata_string = blob.download_as_string()
+                    doc_data = json.loads(metadata_string.decode('utf-8'))
+                except Exception:
+                    continue
+
+                def _matches(field_key: str, field_value: str) -> bool:
+                    return not field_value or (str(doc_data.get(field_key, '')).strip().lower() == str(field_value).strip().lower())
+
+                if not (_matches('board', board) and _matches('subject', subject) and _matches('class', class_) and _matches('language', language)):
+                    continue
+
+                text = doc_data.get('text', '')
+                if not text:
+                    continue
+                candidates.append({
+                    'text': text,
+                    'metadata': {k: v for k, v in doc_data.items() if k != 'text'}
+                })
+                scanned += 1
+                if scanned >= MAX_BLOBS:
+                    break
+
+            if not candidates:
+                logger.warning("Fallback GCS search found no matching candidates")
+                return []
+
+            # Compute similarities
+            query_vec = self.embedding_model.encode(query)
+            texts = [c['text'] for c in candidates]
+            mat = self.embedding_model.encode(texts)
+            # cosine similarity
+            denom = (np.linalg.norm(mat, axis=1) * np.linalg.norm(query_vec))
+            denom[denom == 0] = 1e-9
+            sims = np.dot(mat, query_vec) / denom
+            # Top-k
+            top_idx = np.argsort(-sims)[:top_k]
+            results: List[Dict[str, Any]] = []
+            for idx in top_idx:
+                c = candidates[int(idx)]
+                results.append({
+                    'text': c['text'],
+                    'metadata': c['metadata'],
+                    'similarity': float(sims[int(idx)])
+                })
+            logger.info(f"Fallback GCS search returning {len(results)} results from {scanned} scanned chunks")
+            return results
+        except Exception as e:
+            logger.error(f"Fallback GCS search failed: {e}")
             return []
     
 class AIResponseGenerator:
